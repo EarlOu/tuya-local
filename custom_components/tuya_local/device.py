@@ -608,7 +608,7 @@ class TuyaLocalDevice(object):
 
     def _refresh_cached_state(self):
         if self._api.parent:
-            new_state = {}
+            new_state = {"dps": {}}
         else:
             new_state = self._api.status()
         if new_state and "Err" not in new_state:
