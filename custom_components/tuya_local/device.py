@@ -32,6 +32,8 @@ from .helpers.log import log_json
 
 _LOGGER = logging.getLogger(__name__)
 
+_INIT_LOCK = Lock()
+
 
 def _collect_possible_matches(cached_state, product_ids):
     """Collect possible matches from generator into an array."""
@@ -77,42 +79,38 @@ class TuyaLocalDevice(object):
         self.dev_cid = dev_cid
         self.dev_id = dev_id
         try:
-            if dev_cid:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    parent_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
+            with _INIT_LOCK:
+                _LOGGER.warn("creating %s", self._name)
+                if dev_cid:
+                    if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                        parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
+                        parent_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                    else:
+                        parent = tinytuya.Device(dev_id, address, local_key)
+                        parent_lock = asyncio.Lock()
+                        if name != "Test":
+                            hass.data[DOMAIN][dev_id] = {
+                                "tuyadevice": parent,
+                                "tuyadevicelock": parent_lock,
+                            }
+                    self._api = tinytuya.Device(
+                        dev_cid,
+                        cid=dev_cid,
+                        parent=parent,
                     )
+                    self._api_lock = parent_lock
                 else:
-                    parent = tinytuya.Device(dev_id, address, local_key)
-                    parent_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": parent,
-                            "tuyadevicelock": parent_lock,
-                            "children": {},
-                        }
-                self._api = tinytuya.Device(
-                    dev_cid,
-                    cid=dev_cid,
-                    parent=parent,
-                )
-                self._api_lock = parent_lock
-            else:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    self._api_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
-                    )
-                else:
-                    self._api = tinytuya.Device(dev_id, address, local_key)
-                    self._api_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": self._api,
-                            "tuyadevicelock": self._api_lock,
-                            "children": {},
-                        }
+                    if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                        self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
+                        self._api_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                    else:
+                        self._api = tinytuya.Device(dev_id, address, local_key)
+                        self._api_lock = asyncio.Lock()
+                        if name != "Test":
+                            hass.data[DOMAIN][dev_id] = {
+                                "tuyadevice": self._api,
+                                "tuyadevicelock": self._api_lock,
+                            }
         except Exception as e:
             _LOGGER.error(
                 "%s: %s while initialising device %s",
@@ -311,73 +309,71 @@ class TuyaLocalDevice(object):
         while self._running:
             await asyncio.sleep(0.1)
             error_count = self._api_working_protocol_failures
-            try:
-                # Ensure only one reading action at a time.
-                await self._api_lock.acquire()
-                poll = await self._hass.async_add_executor_job(
-                    self._api.receive,
-                )
+            # Ensure only one reading action at a time.
+            async with self._api_lock:
+                try:
+                    poll = await self._hass.async_add_executor_job(
+                        self._api.receive,
+                    )
 
-                if not poll:
-                    continue
-
-                if "Error" in poll:
-                    # increment the error count if not done already
-                    if error_count == self._api_working_protocol_failures:
-                        self._api_working_protocol_failures += 1
-                    if self._api_working_protocol_failures == 1:
-                        _LOGGER.warning(
-                            "%s error reading: %s", self.name, poll["Error"]
-                        )
-                    else:
-                        _LOGGER.debug(
-                            "%s error reading: %s", self.name, poll["Error"]
-                        )
-                    if "Payload" in poll and poll["Payload"]:
-                        _LOGGER.debug(
-                            "%s err payload: %s",
-                            self.name,
-                            poll["Payload"],
-                        )
-                    continue
-
-                # We got a good data, starting persist connection
-                self._api.set_socketPersistent(True)
-
-                # Message for child devices.
-                if 'cid' in poll:
-                    cid = poll['cid']
-                    _LOGGER.debug("Push message for cid: %s", cid)
-                    if cid not in self._hass.data[DOMAIN][self.dev_id]["children"]:
-                        _LOGGER.warn("Recieve unknown cid: %s, %s, %s", cid, self.dev_id, self._hass.data[DOMAIN][self.dev_id]["children"])
+                    if not poll:
                         continue
+
+                    if "Error" in poll:
+                        # increment the error count if not done already
+                        if error_count == self._api_working_protocol_failures:
+                            self._api_working_protocol_failures += 1
+                        if self._api_working_protocol_failures == 1:
+                            _LOGGER.warning(
+                                "%s error reading: %s", self.name, poll["Error"]
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "%s error reading: %s", self.name, poll["Error"]
+                            )
+                        if "Payload" in poll and poll["Payload"]:
+                            _LOGGER.debug(
+                                "%s err payload: %s",
+                                self.name,
+                                poll["Payload"],
+                            )
+                        continue
+
+                    # We got a good data, starting persist connection
+                    self._api.set_socketPersistent(True)
+
+                    # Message for child devices.
+                    if 'cid' in poll:
+                        cid = poll['cid']
+                        _LOGGER.debug("Push message for cid: %s", cid)
+                        if cid not in self._hass.data[DOMAIN]:
+                            _LOGGER.warn("Recieve unknown cid: %s, %s", cid, self.dev_id)
+                            continue
+                        if "dps" in poll:
+                              poll = poll["dps"]
+                        await self._hass.data[DOMAIN][cid]["device"]._poll_queue.put(poll)
+                        continue
+
+                    # Message for gateway itself
                     if "dps" in poll:
                           poll = poll["dps"]
-                    await self._hass.data[DOMAIN][self.dev_id]["children"][cid]._poll_queue.put(poll)
-                    continue
+                    _LOGGER.warn("Push message for gateway")
+                    yield poll
 
-                # Message for gateway itself
-                if "dps" in poll:
-                      poll = poll["dps"]
-                _LOGGER.warn("Push message for gateway")
-                yield poll
+                except CancelledError:
+                    self._running = False
+                    # Close the persistent connection when exiting the loop
+                    self._api.set_socketPersistent(False)
+                    raise
+                except Exception as t:
+                    _LOGGER.exception(
+                        "%s receive loop error %s:%s",
+                        self.name,
+                        type(t).__name__,
+                        t,
+                    )
+                    self._api.set_socketPersistent(False)
 
-            except CancelledError:
-                self._running = False
-                # Close the persistent connection when exiting the loop
-                self._api.set_socketPersistent(False)
-                raise
-            except Exception as t:
-                _LOGGER.exception(
-                    "%s receive loop error %s:%s",
-                    self.name,
-                    type(t).__name__,
-                    t,
-                )
-                self._api.set_socketPersistent(False)
-            finally:
-                if self._api_lock.locked():
-                    self._api_lock.release()
         # Close the persistent connection when exiting the loop
         self._api.set_socketPersistent(False)
 
@@ -386,9 +382,6 @@ class TuyaLocalDevice(object):
         _LOGGER.warning(
             "%s starting child loop", self.name
         )
-
-        _LOGGER.debug("insert cid: %s %s %s", self._name, self.dev_id, self.dev_cid)
-        self._hass.data[DOMAIN][self.dev_id]["children"][self.dev_cid] = self
 
         while self._running:
             try:
@@ -578,10 +571,11 @@ class TuyaLocalDevice(object):
     async def async_refresh(self):
         _LOGGER.warn("Refreshing device state for %s", self.name)
         if not self._running:
-            await self._retry_on_failed_connection(
-                lambda: self._refresh_cached_state(),
-                f"Failed to refresh device state for {self.name}.",
-            )
+            async with self._api_lock:
+                await self._retry_on_failed_connection(
+                    lambda: self._refresh_cached_state(),
+                    f"Failed to refresh device state for {self.name}.",
+                )
 
     def get_property(self, dps_id):
         cached_state = self._get_cached_state()
@@ -607,10 +601,7 @@ class TuyaLocalDevice(object):
         self._last_connection = 0
 
     def _refresh_cached_state(self):
-        if self._api.parent:
-            new_state = {"dps": {}}
-        else:
-            new_state = self._api.status()
+        new_state = self._api.status()
         if new_state and "Err" not in new_state:
             self._cached_state = self._cached_state | new_state.get("dps", {})
             self._cached_state["updated_at"] = time()
@@ -700,10 +691,11 @@ class TuyaLocalDevice(object):
             log_json(pending_properties),
         )
 
-        await self._retry_on_failed_connection(
-            lambda: self._set_values(pending_properties),
-            "Failed to update device state.",
-        )
+        async with self._api_lock:
+            await self._retry_on_failed_connection(
+                lambda: self._set_values(pending_properties),
+                "Failed to update device state.",
+            )
 
     def _set_values(self, properties):
         try:
@@ -847,7 +839,7 @@ class TuyaLocalDevice(object):
 def setup_device(hass: HomeAssistant, config: dict):
     """Setup a tuya device based on passed in config."""
 
-    _LOGGER.info("Creating device: %s", get_device_id(config))
+    _LOGGER.warn("Setup device: %s", get_device_id(config))
     hass.data[DOMAIN] = hass.data.get(DOMAIN, {})
     device = TuyaLocalDevice(
         config[CONF_NAME],
