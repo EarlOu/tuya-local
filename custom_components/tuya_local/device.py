@@ -31,6 +31,7 @@ from .helpers.device_config import possible_matches
 from .helpers.log import log_json
 
 _LOGGER = logging.getLogger(__name__)
+_INIT_LOCK = Lock()
 
 
 def _collect_possible_matches(cached_state, product_ids):
@@ -75,40 +76,37 @@ class TuyaLocalDevice(object):
         self._api_working_protocol_failures = 0
         self.dev_cid = dev_cid
         try:
-            if dev_cid:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    parent_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
+            with _INIT_LOCK:
+                if dev_cid:
+                    if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                        parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
+                        parent_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                    else:
+                        parent = tinytuya.Device(dev_id, address, local_key)
+                        parent_lock = asyncio.Lock()
+                        if name != "Test":
+                            hass.data[DOMAIN][dev_id] = {
+                                "tuyadevice": parent,
+                                "tuyadevicelock": parent_lock,
+                            }
+                    self._api = tinytuya.Device(
+                        dev_cid,
+                        cid=dev_cid,
+                        parent=parent,
                     )
+                    self._api_lock = parent_lock
                 else:
-                    parent = tinytuya.Device(dev_id, address, local_key)
-                    parent_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": parent,
-                            "tuyadevicelock": parent_lock,
-                        }
-                self._api = tinytuya.Device(
-                    dev_cid,
-                    cid=dev_cid,
-                    parent=parent,
-                )
-                self._api_lock = parent_lock
-            else:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    self._api_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
-                    )
-                else:
-                    self._api = tinytuya.Device(dev_id, address, local_key)
-                    self._api_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": self._api,
-                            "tuyadevicelock": self._api_lock,
-                        }
+                    if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                        self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
+                        self._api_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                    else:
+                        self._api = tinytuya.Device(dev_id, address, local_key)
+                        self._api_lock = asyncio.Lock()
+                        if name != "Test":
+                            hass.data[DOMAIN][dev_id] = {
+                                "tuyadevice": self._api,
+                                "tuyadevicelock": self._api_lock,
+                            }
         except Exception as e:
             _LOGGER.error(
                 "%s: %s while initialising device %s",
