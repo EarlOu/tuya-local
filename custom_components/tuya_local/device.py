@@ -74,20 +74,25 @@ class TuyaLocalDevice(object):
         self._api_protocol_version_index = None
         self._api_protocol_working = False
         self._api_working_protocol_failures = 0
+        self._poll_queue = asyncio.Queue()
         self.dev_cid = dev_cid
+        self.dev_id = dev_id
         try:
             with _INIT_LOCK:
                 if dev_cid:
                     if hass.data[DOMAIN].get(dev_id) and name != "Test":
                         parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
                         parent_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                        cmd_queue = hass.data[DOMAIN][dev_id]["tuyadevicequeue"]
                     else:
                         parent = tinytuya.Device(dev_id, address, local_key)
                         parent_lock = asyncio.Lock()
+                        cmd_queue = asyncio.Queue(1)
                         if name != "Test":
                             hass.data[DOMAIN][dev_id] = {
                                 "tuyadevice": parent,
                                 "tuyadevicelock": parent_lock,
+                                "tuyadevicequeue": cmd_queue,
                             }
                     self._api = tinytuya.Device(
                         dev_cid,
@@ -95,17 +100,21 @@ class TuyaLocalDevice(object):
                         parent=parent,
                     )
                     self._api_lock = parent_lock
+                    self._api_cmd_queue = cmd_queue
                 else:
                     if hass.data[DOMAIN].get(dev_id) and name != "Test":
                         self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
                         self._api_lock = hass.data[DOMAIN][dev_id]["tuyadevicelock"]
+                        self._api_cmd_queue = hass.data[DOMAIN][dev_id]["tuyadevicequeue"]
                     else:
                         self._api = tinytuya.Device(dev_id, address, local_key)
                         self._api_lock = asyncio.Lock()
+                        self._api_cmd_queue = asyncio.Queue(1)
                         if name != "Test":
                             hass.data[DOMAIN][dev_id] = {
                                 "tuyadevice": self._api,
                                 "tuyadevicelock": self._api_lock,
+                                "tuyadevicequeue": cmd_queue,
                             }
         except Exception as e:
             _LOGGER.error(
@@ -246,7 +255,6 @@ class TuyaLocalDevice(object):
                     full_poll = poll.pop("full_poll", False)
                     self._cached_state = self._cached_state | poll
                     self._cached_state["updated_at"] = time()
-                    self._remove_properties_from_pending_updates(poll)
 
                     for entity in self._children:
                         # let entities trigger off poll contents directly
@@ -287,120 +295,61 @@ class TuyaLocalDevice(object):
         self._temporary_poll = False
 
     async def async_receive(self):
-        """Receive messages from a persistent connection asynchronously."""
-        # If we didn't yet get any state from the device, we may need to
-        # negotiate the protocol before making the connection persistent
-        persist = not self.should_poll
-        # flag to alternate updatedps and status calls to ensure we get
-        # all dps updated
-        dps_updated = False
-
-        self._api.set_socketPersistent(persist)
         if self._api.parent:
-            self._api.parent.set_socketPersistent(persist)
-
-        while self._running:
-            error_count = self._api_working_protocol_failures
-            force_backoff = False
-            try:
-                async with self._api_lock:
-                    last_cache = self._cached_state.get("updated_at", 0)
-                    now = time()
-                    full_poll = False
-                    if persist == self.should_poll:
-                        # use persistent connections after initial communication
-                        # has been established.  Until then, we need to rotate
-                        # the protocol version, which seems to require a fresh
-                        # connection.
-                        persist = not self.should_poll
-                        _LOGGER.debug(
-                            "%s persistant connection set to %s", self.name, persist
-                        )
-                        self._api.set_socketPersistent(persist)
-                        if self._api.parent:
-                            self._api.parent.set_socketPersistent(persist)
-
-                    if now - last_cache > self._CACHE_TIMEOUT:
-                        if (
-                            self._force_dps
-                            and not dps_updated
-                            and self._api_protocol_working
-                        ):
-                            poll = await self._retry_on_failed_connection(
-                                lambda: self._api.updatedps(self._force_dps),
-                                f"Failed to update device dps for {self.name}",
-                            )
-                            dps_updated = True
-                        else:
-                            poll = await self._retry_on_failed_connection(
-                                lambda: self._api.status(),
-                                f"Failed to fetch device status for {self.name}",
-                            )
-                            dps_updated = False
-                            full_poll = True
-                    elif persist:
+            # This is a device under gateway
+            while self._running:
+                try:
+                    poll = await asyncio.wait_for(self._poll_queue.get(), 5)
+                    _LOGGER.debug(
+                        "%s receiving poll %s", self.name, poll
+                    )
+                    yield poll
+                except asyncio.TimeoutError:
+                    self._api.set_socketPersistent(True)
+                    async with self._api_lock:
                         await self._hass.async_add_executor_job(
-                            self._api.heartbeat,
-                            True,
-                        )
-                        poll = await self._hass.async_add_executor_job(
-                            self._api.receive,
-                        )
-                    else:
-                        force_backoff = True
-                        poll = None
+                            lambda: self._api.status(nowait=True))
 
-                    if poll:
-                        if "Error" in poll:
-                            # increment the error count if not done already
-                            if error_count == self._api_working_protocol_failures:
-                                self._api_working_protocol_failures += 1
-                            if self._api_working_protocol_failures == 1:
-                                _LOGGER.warning(
-                                    "%s error reading: %s", self.name, poll["Error"]
-                                )
-                            else:
-                                _LOGGER.debug(
-                                    "%s error reading: %s", self.name, poll["Error"]
-                                )
-                            if "Payload" in poll and poll["Payload"]:
-                                _LOGGER.debug(
-                                    "%s err payload: %s",
-                                    self.name,
-                                    poll["Payload"],
-                                )
-                        else:
-                            if "dps" in poll:
-                                poll = poll["dps"]
-                            poll["full_poll"] = full_poll
-                            yield poll
+        else:
+            while self._running:
+                try:
+                    if not self._api._get_socket(False):
+                        _LOGGER.error("Failed to establish connection")
+                        asyncio.sleep(1)
+                        continue
+                    self._api.set_socketPersistent(True)
+                    msg = await self._hass.async_add_executor_job(
+                            self._api._receive)
+                except TimeoutError as err:
+                    _LOGGER.warn("No msg while polling")
+                    asyncio.sleep(1)
+                    continue
+                except Exception as err:
+                    _LOGGER.exception("Error when polling socket")
+                    asyncio.sleep(1)
+                    continue
 
-            except CancelledError:
-                self._running = False
-                # Close the persistent connection when exiting the loop
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
-                raise
-            except Exception as t:
-                _LOGGER.exception(
-                    "%s receive loop error %s:%s",
-                    self.name,
-                    type(t).__name__,
-                    t,
-                )
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
-                force_backoff = True
-            if not self.has_returned_state:
-                force_backoff = True
-            await asyncio.sleep(5 if force_backoff else 0.1)
+                if not msg or len(msg.payload) == 0:
+                    # Null payload, this is an ACK packet.
+                    await self._api_cmd_queue.get()
+                    _LOGGER.debug("PROTOCOL: ACKED %d", self._api_cmd_queue.qsize())
+                    continue
 
-        # Close the persistent connection when exiting the loop
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+                poll = self._api._process_message(msg)
+                if 'cid' in poll:
+                    cid = poll['cid']
+                    _LOGGER.debug("Push message for cid: %s", cid)
+                    if cid not in self._hass.data[DOMAIN]:
+                        _LOGGER.warn("Recieve unknown cid: %s, %s", cid, self.dev_id)
+                        continue
+                    if "dps" in poll:
+                        poll = poll["dps"]
+                    await self._hass.data[DOMAIN][cid]["device"]._poll_queue.put(poll)
+                    continue
+
+                if "dps" in poll:
+                    poll = poll["dps"]
+                yield poll
 
     def set_detected_product_id(self, product_id):
         self._product_ids.append(product_id)
@@ -464,11 +413,10 @@ class TuyaLocalDevice(object):
     async def async_refresh(self):
         _LOGGER.debug("Refreshing device state for %s", self.name)
         if not self._running:
-            async with self._api_lock:
-                await self._retry_on_failed_connection(
-                    lambda: self._refresh_cached_state(),
-                    f"Failed to refresh device state for {self.name}.",
-                )
+            await self._retry_on_failed_connection(
+                lambda: self._refresh_cached_state(),
+                f"Failed to refresh device state for {self.name}.",
+            )
 
     def get_property(self, dps_id):
         cached_state = self._get_cached_state()
@@ -494,7 +442,8 @@ class TuyaLocalDevice(object):
         self._last_connection = 0
 
     def _refresh_cached_state(self):
-        new_state = self._api.status()
+        # new_state = self._api.status()
+        new_state = {"dps": {}}
         if new_state and "Err" not in new_state:
             self._cached_state = self._cached_state | new_state.get("dps", {})
             self._cached_state["updated_at"] = time()
@@ -534,75 +483,28 @@ class TuyaLocalDevice(object):
         if len(properties) == 0:
             return
 
-        self._add_properties_to_pending_updates(properties)
-        await self._debounce_sending_updates()
-
-    def _add_properties_to_pending_updates(self, properties):
-        now = time()
-
-        pending_updates = self._get_pending_updates()
-        for key, value in properties.items():
-            pending_updates[key] = {
-                "value": value,
-                "updated_at": now,
-                "sent": False,
-            }
-
-        _LOGGER.debug(
-            "%s new pending updates: %s",
-            self.name,
-            log_json(pending_updates),
-        )
-
-    def _remove_properties_from_pending_updates(self, data):
-        self._pending_updates = {
-            key: value
-            for key, value in self._pending_updates.items()
-            if key not in data or not value["sent"] or data[key] != value["value"]
-        }
-
-    async def _debounce_sending_updates(self):
-        now = time()
-        since = now - self._last_connection
-        # set this now to avoid a race condition, it will be updated later
-        # when the data is actally sent
-        self._last_connection = now
-        # Only delay a second if there was recently another command.
-        # Otherwise delay 1ms, to keep things simple by reusing the
-        # same send mechanism.
-        waittime = 1 if since < 1.1 and self.should_poll else 0.001
-
-        await asyncio.sleep(waittime)
-        await self._send_pending_updates()
-
-    async def _send_pending_updates(self):
-        pending_properties = self._get_unsent_properties()
-
         _LOGGER.debug(
             "%s sending dps update: %s",
             self.name,
-            log_json(pending_properties),
+            log_json(properties),
         )
 
-        async with self._api_lock:
-            await self._retry_on_failed_connection(
-                lambda: self._set_values(pending_properties),
-                "Failed to update device state.",
-            )
+        await self._async_send_control_and_wait_ack(
+            lambda: self._api.set_multiple_values(properties, nowait=True),
+            "Failed to update device state."
+        )
 
-    def _set_values(self, properties):
-        try:
-            self._lock.acquire()
-            self._api.set_multiple_values(properties, nowait=True)
-            self._cached_state["updated_at"] = 0
-            now = time()
-            self._last_connection = now
-            pending_updates = self._get_pending_updates()
-            for key in properties.keys():
-                pending_updates[key]["updated_at"] = now
-                pending_updates[key]["sent"] = True
-        finally:
-            self._lock.release()
+    async def _async_send_control_and_wait_ack(self, func, error_message):
+        _LOGGER.debug("PROTOCOL: %d", self._api_cmd_queue.qsize())
+        await self._api_cmd_queue.put(None)
+        async with self._api_lock:
+            retval = await self._hass.async_add_executor_job(func)
+        _LOGGER.debug("PROTOCOL: SENT %d", self._api_cmd_queue.qsize())
+        if isinstance(retval, dict) and "Error" in retval:
+            await self._api_cmd_queue.get()
+            _LOGGER.debug("PROTOCOL: ACKED %d", self._api_cmd_queue.qsize())
+            _LOGGER.error("%s: %s", error_message, retval)
+        return retval
 
     async def _retry_on_failed_connection(self, func, error_message):
         if self._api_protocol_version_index is None:
@@ -748,6 +650,7 @@ def setup_device(hass: HomeAssistant, config: dict):
         "device": device,
         "tuyadevice": device._api,
         "tuyadevicelock": device._api_lock,
+        "tuyadevicequeue": device._api_cmd_queue,
     }
 
     return device
