@@ -331,7 +331,11 @@ class TuyaLocalDevice(object):
 
                 if not msg or len(msg.payload) == 0:
                     # Null payload, this is an ACK packet.
-                    await self._api_cmd_queue.get()
+                    try:
+                        self._api_cmd_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        _LOGGER.warn("%s: cmd queue is empty", self._name)
+
                     _LOGGER.debug("PROTOCOL: ACKED %d", self._api_cmd_queue.qsize())
                     continue
 
@@ -495,15 +499,23 @@ class TuyaLocalDevice(object):
         )
 
     async def _async_send_control_and_wait_ack(self, func, error_message):
-        _LOGGER.debug("PROTOCOL: %d", self._api_cmd_queue.qsize())
-        await self._api_cmd_queue.put(None)
-        async with self._api_lock:
-            retval = await self._hass.async_add_executor_job(func)
-        _LOGGER.debug("PROTOCOL: SENT %d", self._api_cmd_queue.qsize())
-        if isinstance(retval, dict) and "Error" in retval:
-            await self._api_cmd_queue.get()
-            _LOGGER.debug("PROTOCOL: ACKED %d", self._api_cmd_queue.qsize())
-            _LOGGER.error("%s: %s", error_message, retval)
+        try:
+            async with self._api_lock:
+                try:
+                    await asyncio.wait_for(self._api_cmd_queue.put(None), 5)
+                except asyncio.TimeoutError:
+                    _LOGGER.warn("%s: Timeout waiting for cmd queue", self._name)
+                _LOGGER.debug("PROTOCOL: SENT %d", self._api_cmd_queue.qsize())
+                retval = await self._hass.async_add_executor_job(func)
+                if isinstance(retval, dict) and "Error" in retval:
+                    raise AttributeError(retval["Error"])
+        except Exception as e:
+            _LOGGER.exception("%s: Failed to send command", self._name)
+            try:
+                self._api_cmd_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                _LOGGER.warn("%s: cmd queue is empty", self._name)
+            return None
         return retval
 
     async def _retry_on_failed_connection(self, func, error_message):
