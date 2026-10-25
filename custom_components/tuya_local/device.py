@@ -472,18 +472,19 @@ class TuyaLocalDevice(object):
             # vendor specific dps start.  Between them, these three should cover
             # most devices.  148 covers a doorbell device that didn't have these
             # 201 covers remote controllers and 2 and 9 cover others without 1
-            self._api.set_dpsUsed(
-                {
-                    "1": None,
-                    "2": None,
-                    "9": None,
-                    "20": None,
-                    "60": None,
-                    "101": None,
-                    "148": None,
-                    "201": None,
-                }
-            )
+            async with self._api_lock:
+                self._api.set_dpsUsed(
+                    {
+                        "1": None,
+                        "2": None,
+                        "9": None,
+                        "20": None,
+                        "60": None,
+                        "101": None,
+                        "148": None,
+                        "201": None,
+                    }
+                )
             await self.async_refresh()
             cached_state = self._get_cached_state()
 
