@@ -5,6 +5,7 @@ API for Tuya Local devices.
 import asyncio
 import logging
 from asyncio.exceptions import CancelledError
+from threading import Lock
 from time import time
 
 import tinytuya
@@ -32,6 +33,7 @@ from .helpers.device_config import possible_matches
 from .helpers.log import log_json
 
 _LOGGER = logging.getLogger(__name__)
+_INIT_LOCK = Lock()
 
 # Extra context for tinytuya error codes whose message does not fully describe
 # the possible causes.  Error 914 in particular is reported for any failure to
@@ -91,40 +93,28 @@ class TuyaLocalDevice(object):
         self.dev_id = dev_id
         self.dev_cid = dev_cid
         try:
-            if dev_cid:
+            with _INIT_LOCK:
                 if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    parent_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
-                    )
-                else:
-                    parent = tinytuya.Device(dev_id, address, local_key)
-                    parent_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": parent,
-                            "tuyadevicelock": parent_lock,
-                        }
-                self._api = tinytuya.Device(
-                    dev_cid,
-                    cid=dev_cid,
-                    parent=parent,
-                )
-                self._api_lock = parent_lock
-            else:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
+                    device = hass.data[DOMAIN][dev_id]["tuyadevice"]
                     self._api_lock = hass.data[DOMAIN][dev_id].get(
                         "tuyadevicelock", asyncio.Lock()
                     )
                 else:
-                    self._api = tinytuya.Device(dev_id, address, local_key)
+                    device = tinytuya.Device(dev_id, address, local_key)
                     self._api_lock = asyncio.Lock()
                     if name != "Test":
                         hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": self._api,
+                            "tuyadevice": device,
                             "tuyadevicelock": self._api_lock,
                         }
+                if dev_cid:
+                    self._api = tinytuya.Device(
+                        dev_cid,
+                        cid=dev_cid,
+                        parent=device,
+                    )
+                else:
+                    self._api = device
         except Exception as e:
             _LOGGER.error(
                 "%s: %s while initialising device %s",
@@ -318,7 +308,7 @@ class TuyaLocalDevice(object):
 
     def pause(self):
         self._temporary_poll = True
-        _LOGGER.debug("%s pausing connection temporarily", self.name, False)
+        _LOGGER.debug("%s pausing connection temporarily", self.name)
         self._api.set_socketPersistent(False)
         if self._api.parent:
             self._api.parent.set_socketPersistent(False)

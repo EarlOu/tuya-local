@@ -76,6 +76,31 @@ def test_subdevice_unique_id_is_scoped_by_gateway(patched_hass, mock_api):
     assert subject.unique_id == "gateway_id/child_id"
 
 
+def test_subdevices_share_gateway_lock_on_init(patched_hass, mock_api):
+    """Subdevices under the same gateway share the parent device and lock."""
+    child1 = TuyaLocalDevice(
+        "Child 1",
+        "gateway_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    child2 = TuyaLocalDevice(
+        "Child 2",
+        "gateway_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid2",
+        patched_hass,
+    )
+
+    assert child1._api_lock is child2._api_lock
+    assert patched_hass.data[DOMAIN]["gateway_id"]["tuyadevicelock"] is child1._api_lock
+
+
 def test_device_info(subject, mock_api):
     """Returns generic info plus the unique ID for categorisation."""
     assert subject.device_info == {
