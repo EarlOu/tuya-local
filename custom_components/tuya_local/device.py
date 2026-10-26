@@ -90,6 +90,7 @@ class TuyaLocalDevice(object):
         self._api_protocol_version_index = None
         self._api_protocol_working = False
         self._api_working_protocol_failures = 0
+        self._online = True
         self._poll_queue = asyncio.Queue()
         self.dev_id = dev_id
         self.dev_cid = dev_cid
@@ -189,8 +190,21 @@ class TuyaLocalDevice(object):
     @property
     def has_returned_state(self):
         """Return True if the device has returned some state."""
+        if not self._online:
+            return False
         cached = self._get_cached_state()
         return len(cached) > 1 or cached.get("updated_at", 0) > 0
+
+    def set_online(self, online: bool):
+        """Update the online status of the device."""
+        if self._online == online:
+            return
+        self._online = online
+        if not online:
+            _LOGGER.debug("%s reported offline, marking unavailable", self.name)
+            self._reset_cached_state()
+        for entity in self._children:
+            entity.schedule_update_ha_state()
 
     @callback
     def actually_start(self, event=None):
@@ -337,9 +351,16 @@ class TuyaLocalDevice(object):
             while self._running:
                 try:
                     poll = await asyncio.wait_for(self._poll_queue.get(), 5)
+                    self.set_online(True)
                     _LOGGER.debug("%s receiving poll %s", self.name, poll)
                     yield poll
                 except asyncio.TimeoutError:
+                    last_cache = self._cached_state.get("updated_at", 0)
+                    if (
+                        self.has_returned_state
+                        and time() - last_cache > self._POLLING_INTERVAL
+                    ):
+                        self.set_online(False)
                     self._api.set_socketPersistent(True)
                     async with self._api_lock:
                         await self._hass.async_add_executor_job(

@@ -765,6 +765,41 @@ async def test_async_receive_subdevice_polls_on_timeout(patched_hass, mock_api, 
     assert result == {"1": False}
 
 
+@pytest.mark.asyncio
+async def test_subdevice_marked_unavailable_after_poll_timeout(
+    patched_hass, mock_api, mocker
+):
+    child = TuyaLocalDevice(
+        "Child",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    entity = mocker.MagicMock()
+    child._children = [entity]
+    child._cached_state = {
+        "1": True,
+        "updated_at": time() - child._POLLING_INTERVAL - 1,
+    }
+    assert child.has_returned_state
+
+    child._poll_queue.get = mocker.AsyncMock(
+        side_effect=[asyncio.TimeoutError, {"1": False}]
+    )
+
+    child._running = True
+    child_loop = child.async_receive()
+    result = await child_loop.__anext__()
+
+    assert not child.has_returned_state
+    # Called once when marked offline on timeout, and once when marked back online on poll
+    assert entity.schedule_update_ha_state.call_count == 2
+    assert result == {"1": False}
+
+
 def test_should_poll(subject):
     subject._cached_state = {"1": "sample", "updated_at": time()}
     subject._poll_only = False
