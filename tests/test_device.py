@@ -800,6 +800,97 @@ async def test_subdevice_marked_unavailable_after_poll_timeout(
     assert result == {"1": False}
 
 
+@pytest.mark.asyncio
+async def test_subdevice_online_stat_report_marks_offline_and_online(
+    patched_hass, mock_api, mocker
+):
+    gateway = TuyaLocalDevice(
+        "Gateway",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        None,
+        patched_hass,
+    )
+    child = TuyaLocalDevice(
+        "Child",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    entity = mocker.MagicMock()
+    child._children = [entity]
+    child._cached_state = {"1": True, "updated_at": time()}
+    patched_hass.data[DOMAIN]["gw_id/cid1"] = {"device": child}
+
+    msg1 = mocker.MagicMock(payload=b"stat_offline")
+    msg2 = mocker.MagicMock(payload=b"stale_cid_push")
+    msg3 = mocker.MagicMock(payload=b"stat_online")
+    msg4 = mocker.MagicMock(payload=b"gw_dps")
+
+    mock_api()._get_socket.return_value = True
+    mock_api()._receive.side_effect = [msg1, msg2, msg3, msg4]
+    mock_api()._process_message.side_effect = [
+        {
+            "reqType": "subdev_online_stat_report",
+            "data": {"online": [], "offline": ["cid1"]},
+        },
+        {"cid": "cid1", "dps": {"1": True}},
+        {
+            "reqType": "subdev_online_stat_query",
+            "data": {"cids": ["cid1"], "online": [1]},
+        },
+        {"dps": {"2": "gw_val"}},
+    ]
+
+    gateway._running = True
+    gw_loop = gateway.async_receive()
+    gw_result = await gw_loop.__anext__()
+
+    assert gw_result == {"2": "gw_val"}
+    # Stale push while offline was ignored
+    assert child._poll_queue.empty()
+    # Child was marked offline then online again, triggering status poll
+    assert child._online is True
+    assert not child.has_returned_state
+    assert entity.schedule_update_ha_state.call_count == 2
+    mock_api().status.assert_called_once_with(nowait=True)
+
+
+@pytest.mark.asyncio
+async def test_offline_subdevice_queries_gateway_on_timeout(
+    patched_hass, mock_api, mocker
+):
+    child = TuyaLocalDevice(
+        "Child",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    child.set_online(False)
+    parent_mock = mocker.MagicMock()
+    child._api.parent = parent_mock
+    child._poll_queue.get = mocker.AsyncMock(
+        side_effect=[asyncio.TimeoutError, {"1": True}]
+    )
+
+    child._running = True
+    child_loop = child.async_receive()
+    result = await child_loop.__anext__()
+
+    parent_mock.subdev_query.assert_called_once_with(nowait=True)
+    mock_api().status.assert_not_called()
+    assert child._online is True
+    assert result == {"1": True}
+
+
 def test_should_poll(subject):
     subject._cached_state = {"1": "sample", "updated_at": time()}
     subject._poll_only = False

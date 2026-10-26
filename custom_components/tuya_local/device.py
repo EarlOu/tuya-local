@@ -344,6 +344,39 @@ class TuyaLocalDevice(object):
         entry = domain_data.get(child_id) or domain_data.get(cid)
         return entry.get("device") if entry else None
 
+    async def _async_handle_subdev_online_stat(self, data: dict):
+        cids = data.get("cids")
+        online = data.get("online")
+        if (
+            isinstance(cids, list)
+            and isinstance(online, list)
+            and len(cids) == len(online)
+            and all(isinstance(x, (int, bool)) for x in online)
+        ):
+            statuses = [(cid, bool(st)) for cid, st in zip(cids, online, strict=True)]
+        else:
+            statuses = [
+                *(
+                    (cid, False)
+                    for cid in (
+                        data["offline"] if isinstance(data.get("offline"), list) else []
+                    )
+                ),
+                *((cid, True) for cid in (online if isinstance(online, list) else [])),
+            ]
+
+        for cid, is_online in statuses:
+            child = self._find_child_device(cid)
+            if not child:
+                continue
+            was_online = child._online
+            child.set_online(is_online)
+            if is_online and not was_online:
+                async with child._api_lock:
+                    await self._hass.async_add_executor_job(
+                        lambda c=child: c._api.status(nowait=True)
+                    )
+
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
         if self.dev_cid:
@@ -363,9 +396,14 @@ class TuyaLocalDevice(object):
                         self.set_online(False)
                     self._api.set_socketPersistent(True)
                     async with self._api_lock:
-                        await self._hass.async_add_executor_job(
-                            lambda: self._api.status(nowait=True)
-                        )
+                        if self._online:
+                            await self._hass.async_add_executor_job(
+                                lambda: self._api.status(nowait=True)
+                            )
+                        elif self._api.parent:
+                            await self._hass.async_add_executor_job(
+                                lambda: self._api.parent.subdev_query(nowait=True)
+                            )
         else:
             while self._running:
                 try:
@@ -385,6 +423,10 @@ class TuyaLocalDevice(object):
                             self._api.heartbeat,
                             True,
                         )
+                        if getattr(self._api, "children", None):
+                            await self._hass.async_add_executor_job(
+                                lambda: self._api.subdev_query(nowait=True)
+                            )
                     await asyncio.sleep(1)
                     continue
                 except Exception:
@@ -404,12 +446,23 @@ class TuyaLocalDevice(object):
                     continue
 
                 poll = self._api._process_message(msg)
+                if (
+                    isinstance(poll, dict)
+                    and poll.get("reqType")
+                    in ("subdev_online_stat_report", "subdev_online_stat_query")
+                    and isinstance(poll.get("data"), dict)
+                ):
+                    await self._async_handle_subdev_online_stat(poll["data"])
+                    continue
+
                 if isinstance(poll, dict) and "cid" in poll:
                     cid = poll["cid"]
                     _LOGGER.debug("Push message for cid: %s", cid)
                     child = self._find_child_device(cid)
                     if not child:
                         _LOGGER.warning("Receive unknown cid: %s, %s", cid, self.dev_id)
+                        continue
+                    if not child._online:
                         continue
                     if "dps" in poll:
                         poll = poll["dps"]
