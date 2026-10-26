@@ -99,13 +99,18 @@ class TuyaLocalDevice(object):
                     self._api_lock = hass.data[DOMAIN][dev_id].get(
                         "tuyadevicelock", asyncio.Lock()
                     )
+                    self._api_cmd_queue = hass.data[DOMAIN][dev_id].get(
+                        "tuyadevicequeue", asyncio.Queue(1)
+                    )
                 else:
                     device = tinytuya.Device(dev_id, address, local_key)
                     self._api_lock = asyncio.Lock()
+                    self._api_cmd_queue = asyncio.Queue(1)
                     if name != "Test":
                         hass.data[DOMAIN][dev_id] = {
                             "tuyadevice": device,
                             "tuyadevicelock": self._api_lock,
+                            "tuyadevicequeue": self._api_cmd_queue,
                         }
                 if dev_cid:
                     self._api = tinytuya.Device(
@@ -594,7 +599,7 @@ class TuyaLocalDevice(object):
             return
 
         self._add_properties_to_pending_updates(properties)
-        await self._debounce_sending_updates()
+        await self._send_pending_updates()
 
     def _add_properties_to_pending_updates(self, properties):
         now = time()
@@ -620,20 +625,6 @@ class TuyaLocalDevice(object):
             if key not in data or not value["sent"] or data[key] != value["value"]
         }
 
-    async def _debounce_sending_updates(self):
-        now = time()
-        since = now - self._last_connection
-        # set this now to avoid a race condition, it will be updated later
-        # when the data is actally sent
-        self._last_connection = now
-        # Only delay a second if there was recently another command.
-        # Otherwise delay 1ms, to keep things simple by reusing the
-        # same send mechanism.
-        waittime = 1 if since < 1.1 and self.should_poll else 0.001
-
-        await asyncio.sleep(waittime)
-        await self._send_pending_updates()
-
     async def _send_pending_updates(self):
         pending_properties = self._get_unsent_properties()
 
@@ -643,19 +634,41 @@ class TuyaLocalDevice(object):
             log_json(pending_properties),
         )
 
-        await self._retry_on_failed_connection(
+        await self._async_send_control_and_wait_ack(
             lambda: self._set_values(pending_properties),
             "Failed to update device state.",
         )
 
     def _set_values(self, properties):
-        self._api.set_multiple_values(properties, nowait=True)
+        retval = self._api.set_multiple_values(properties, nowait=True)
         now = time()
         self._last_connection = now
         pending_updates = self._get_pending_updates()
         for key in properties.keys():
-            pending_updates[key]["updated_at"] = now
-            pending_updates[key]["sent"] = True
+            if key in pending_updates:
+                pending_updates[key]["updated_at"] = now
+                pending_updates[key]["sent"] = True
+        return retval
+
+    async def _async_send_control_and_wait_ack(self, func, error_message):
+        try:
+            async with self._api_lock:
+                try:
+                    await asyncio.wait_for(self._api_cmd_queue.put(None), 5)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("%s: Timeout waiting for cmd queue", self.name)
+                _LOGGER.debug("PROTOCOL: SENT %d", self._api_cmd_queue.qsize())
+                retval = await self._hass.async_add_executor_job(func)
+                if isinstance(retval, dict) and "Error" in retval:
+                    raise AttributeError(retval["Error"])
+        except Exception:
+            _LOGGER.exception("%s: %s", self.name, error_message)
+            try:
+                self._api_cmd_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                _LOGGER.warning("%s: cmd queue is empty", self.name)
+            return None
+        return retval
 
     async def _retry_on_failed_connection(self, func, error_message):
         if self._api_protocol_version_index is None:
@@ -851,6 +864,7 @@ def setup_device(hass: HomeAssistant, config: dict):
         "device": device,
         "tuyadevice": device._api,
         "tuyadevicelock": device._api_lock,
+        "tuyadevicequeue": device._api_cmd_queue,
     }
 
     return device
@@ -870,6 +884,7 @@ async def async_delete_device(hass: HomeAssistant, config: dict):
         device_entry.pop("device", None)
     device_entry.pop("tuyadevice", None)
     device_entry.pop("tuyadevicelock", None)
+    device_entry.pop("tuyadevicequeue", None)
     # Platform setup may cache entity instances in this bucket by config_id.
     # Only drop empty buckets here; async_unload_entry removes the whole bucket
     # after forwarded platform unloads complete.

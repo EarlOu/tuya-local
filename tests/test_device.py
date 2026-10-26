@@ -357,6 +357,17 @@ async def test_async_set_property_sends_to_api(subject, mock_api):
     await subject.async_set_property("1", False)
 
     mock_api().set_multiple_values.assert_called_once()
+    assert subject._api_cmd_queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_send_control_clears_cmd_queue_on_error(subject, mock_api):
+    mock_api().set_multiple_values.return_value = {"Error": "Command failed"}
+
+    await subject.async_set_property("1", False)
+
+    mock_api().set_multiple_values.assert_called_once()
+    assert subject._api_cmd_queue.qsize() == 0
 
 
 @pytest.mark.asyncio
