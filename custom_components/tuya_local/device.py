@@ -90,6 +90,7 @@ class TuyaLocalDevice(object):
         self._api_protocol_version_index = None
         self._api_protocol_working = False
         self._api_working_protocol_failures = 0
+        self._poll_queue = asyncio.Queue()
         self.dev_id = dev_id
         self.dev_cid = dev_cid
         try:
@@ -231,7 +232,9 @@ class TuyaLocalDevice(object):
         # If this is the first child entity to register, and HA is still
         # starting, refresh the device state so it shows as available without
         # waiting for startup to complete.
-        should_poll = len(self._children) == 0 and not self._hass.is_running
+        should_poll = (
+            len(self._children) == 0 and not self._hass.is_running and not self.dev_cid
+        )
 
         self._children.append(entity)
         for dp in entity._config.dps():
@@ -321,144 +324,80 @@ class TuyaLocalDevice(object):
     def resume(self):
         self._temporary_poll = False
 
+    def _find_child_device(self, cid: str):
+        domain_data = self._hass.data.get(DOMAIN, {})
+        child_id = get_device_id({CONF_DEVICE_ID: self.dev_id, CONF_DEVICE_CID: cid})
+        entry = domain_data.get(child_id) or domain_data.get(cid)
+        return entry.get("device") if entry else None
+
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
-        # If we didn't yet get any state from the device, we may need to
-        # negotiate the protocol before making the connection persistent
-        persist = not self.should_poll
-        # flag to alternate updatedps and status calls to ensure we get
-        # all dps updated
-        dps_updated = False
-
-        self._api.set_socketPersistent(persist)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(persist)
-
-        last_heartbeat = self._cached_state.get("updated_at", 0)
-        wifi_api = self._api.parent or self._api
-        while self._running:
-            error_count = self._api_working_protocol_failures
-            force_backoff = False
-            try:
-                last_cache = self._cached_state.get("updated_at", 0)
-                now = time()
-                full_poll = False
-                if (persist == self.should_poll) or (
-                    persist and (wifi_api.socket is None)
-                ):
-                    # use persistent connections after initial communication
-                    # has been established.  Until then, we need to rotate
-                    # the protocol version, which seems to require a fresh
-                    # connection.
-                    persist = not self.should_poll
-                    _LOGGER.debug(
-                        "%s persistant connection set to %s", self.name, persist
+        if self.dev_cid:
+            # This is a device under gateway
+            while self._running:
+                try:
+                    poll = await asyncio.wait_for(self._poll_queue.get(), 5)
+                    _LOGGER.debug("%s receiving poll %s", self.name, poll)
+                    yield poll
+                except asyncio.TimeoutError:
+                    self._api.set_socketPersistent(True)
+                    async with self._api_lock:
+                        await self._hass.async_add_executor_job(
+                            lambda: self._api.status(nowait=True)
+                        )
+        else:
+            while self._running:
+                try:
+                    sock_res = await self._hass.async_add_executor_job(
+                        self._api._get_socket, False
                     )
-                    self._api.set_socketPersistent(persist)
-                    if self._api.parent:
-                        self._api.parent.set_socketPersistent(persist)
-                    self._last_full_poll = 0  # ensure we start with a full poll
-
-                needs_full_poll = now - self._last_full_poll > self._POLLING_INTERVAL
-                if now - last_cache > self._POLLING_INTERVAL or (
-                    persist and needs_full_poll
-                ):
-                    if (
-                        self._force_dps
-                        and not dps_updated
-                        and self._api_protocol_working
-                    ):
-                        poll = await self._retry_on_failed_connection(
-                            lambda: self._api.updatedps(self._force_dps),
-                            f"Failed to update device dps for {self.name}",
-                        )
-                        dps_updated = True
-                    else:
-                        poll = await self._retry_on_failed_connection(
-                            lambda: self._api.status(),
-                            f"Failed to fetch device status for {self.name}",
-                        )
-                        dps_updated = False
-                        full_poll = True
-                    self._last_full_poll = now
-                    last_heartbeat = now  # reset heartbeat timer on full poll
-                elif persist:
-                    if now - last_heartbeat > self._HEARTBEAT_INTERVAL:
+                    if sock_res is not True:
+                        _LOGGER.error("Failed to establish connection")
+                        await asyncio.sleep(1)
+                        continue
+                    self._api.set_socketPersistent(True)
+                    msg = await self._hass.async_add_executor_job(self._api._receive)
+                except TimeoutError:
+                    _LOGGER.warning("No msg while polling")
+                    async with self._api_lock:
                         await self._hass.async_add_executor_job(
                             self._api.heartbeat,
                             True,
                         )
-                        last_heartbeat = now
-                    poll = await self._hass.async_add_executor_job(
-                        self._api.receive,
-                    )
-                    # Ignore Payload error 904, as 3.4 protocol devices seem to return
-                    # this when there is no new data, instead of just returning nothing.
-                    if poll and "Err" in poll and poll["Err"] == "904":
-                        poll = None
-                else:
-                    force_backoff = True
-                    poll = None
+                    await asyncio.sleep(1)
+                    continue
+                except Exception:
+                    _LOGGER.exception("Error when polling socket")
+                    self._api._check_socket_close(True)
+                    await asyncio.sleep(1)
+                    continue
 
-                if poll:
-                    if "Err" in poll:
-                        # Limit disconnects to the errors that are caused low level
-                        # communication problems
-                        if poll["Err"] in {"901", "902", "905", "906", "914"}:
-                            force_backoff = True
-                            persist = False
-                            self._api.set_socketPersistent(False)
-                            if self._api.parent:
-                                self._api.parent.set_socketPersistent(False)
-                        # increment the error count if not done already
-                        if error_count == self._api_working_protocol_failures:
-                            self._api_working_protocol_failures += 1
-                        if self._api_working_protocol_failures == 1:
-                            _LOGGER.warning(
-                                "%s error reading: %s", self.name, poll["Error"]
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "%s error reading: %s", self.name, poll["Error"]
-                            )
-                        if "Payload" in poll and poll["Payload"]:
-                            _LOGGER.debug(
-                                "%s err payload: %s",
-                                self.name,
-                                poll["Payload"],
-                            )
-                    else:
-                        if "dps" in poll:
-                            poll = poll["dps"]
-                        if isinstance(poll, dict):
-                            poll["full_poll"] = full_poll
-                            yield poll
+                if not msg or len(msg.payload) == 0:
+                    # Null payload, this is an ACK packet.
+                    try:
+                        self._api_cmd_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        _LOGGER.warning("%s: cmd queue is empty", self.name)
 
-            except CancelledError:
-                self._running = False
-                # Close the persistent connection when exiting the loop
-                persist = False
-                _LOGGER.debug("%s receive loop interrupted", self.name)
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
-                raise
-            except Exception as t:
-                _LOGGER.exception(
-                    "%s receive loop error %s:%s",
-                    self.name,
-                    type(t).__name__,
-                    t,
-                )
-                persist = False
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
-                force_backoff = True
+                    _LOGGER.debug("PROTOCOL: ACKED %d", self._api_cmd_queue.qsize())
+                    continue
 
-            if not self.has_returned_state or wifi_api.socket is None:
-                force_backoff = True
-            await asyncio.sleep(5 if force_backoff else 0.1)
+                poll = self._api._process_message(msg)
+                if isinstance(poll, dict) and "cid" in poll:
+                    cid = poll["cid"]
+                    _LOGGER.debug("Push message for cid: %s", cid)
+                    child = self._find_child_device(cid)
+                    if not child:
+                        _LOGGER.warning("Receive unknown cid: %s, %s", cid, self.dev_id)
+                        continue
+                    if "dps" in poll:
+                        poll = poll["dps"]
+                    await child._poll_queue.put(poll)
+                    continue
+
+                if isinstance(poll, dict) and "dps" in poll:
+                    poll = poll["dps"]
+                yield poll
 
         # Close the persistent connection when exiting the loop
         self._api.set_socketPersistent(False)

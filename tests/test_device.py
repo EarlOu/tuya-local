@@ -664,59 +664,105 @@ async def test_unregister_last_entity(subject, mocker):
 
 @pytest.mark.asyncio
 async def test_async_receive(subject, mock_api, mocker):
-    # Set up preconditions
-    mock_api().status.return_value = {"dps": {"1": "INIT", "2": 2}}
-    mock_api().receive.return_value = {"1": "UPDATED"}
+    mocker.patch("asyncio.sleep", return_value=None)
+    msg_ack = mocker.MagicMock()
+    msg_ack.payload = b""
+    msg_data = mocker.MagicMock()
+    msg_data.payload = b"data"
+
+    mock_api()._get_socket.side_effect = [905, True, True, True]
+    mock_api()._receive.side_effect = [
+        ConnectionResetError("socket closed"),
+        msg_ack,
+        msg_data,
+    ]
+    mock_api()._process_message.return_value = {"dps": {"1": "UPDATED"}}
+
+    await subject._api_cmd_queue.put(None)
     subject._running = True
-    subject._cached_state = {"updated_at": 0}
-    # Call the function under test
-    print("starting test loop...")
     loop = subject.async_receive()
-    print("getting first iteration...")
-    result = await loop.__anext__()
 
-    # Check that the loop was started, but without persistent connection
-    # since there was no state returned yet and it might need to negotiate
-    # version.
-    mock_api().set_socketPersistent.assert_called_once_with(False)
-    # Check that a full poll was done
-    mock_api().status.assert_called_once()
-    assert result == {"1": "INIT", "2": 2, "full_poll": True}
-    # Prepare for next round
-    subject._cached_state = subject._cached_state | result
-    mock_api().status.reset_mock()
-    mock_api().set_socketPersistent.reset_mock()
-    print("getting second iteration...")
     result = await loop.__anext__()
-    # Check that the connection was made persistent now that data has been
-    # returned
-    mock_api().set_socketPersistent.assert_called_once_with(True)
-    mock_api().status.reset_mock()
-    # Wait long enough to force a heartbeat poll on the next iteration
-    subject._cached_state = subject._cached_state | {"updated_at": time()}
-    await asyncio.sleep(10.1)
-    print("getting third iteration...")
-    # Call the function under test
-    result = await loop.__anext__()
+    mock_api()._check_socket_close.assert_called_once_with(True)
+    assert subject._api_cmd_queue.qsize() == 0
+    assert result == {"1": "UPDATED"}
 
-    # Check that a heartbeat poll was done
-    mock_api().status.assert_not_called()
-    mock_api().heartbeat.assert_called_once()
-    mock_api().receive.assert_called_once()
-    assert result == {"1": "UPDATED", "full_poll": False}
-    # Prepare for next iteration
     subject._running = False
     mock_api().set_socketPersistent.reset_mock()
-
-    # Call the function under test
-    print("getting last iteration...")
-    try:
-        result = await loop.__anext__()
-        pytest.fail("Should have raised an exception to quit the loop")
-    # Check that the loop terminated
-    except StopAsyncIteration:
-        pass
+    with pytest.raises(StopAsyncIteration):
+        await loop.__anext__()
     mock_api().set_socketPersistent.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_async_receive_gateway_dispatches_to_child(
+    patched_hass, mock_api, mocker
+):
+    gateway = TuyaLocalDevice(
+        "Gateway",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        None,
+        patched_hass,
+    )
+    child = TuyaLocalDevice(
+        "Child",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    patched_hass.data[DOMAIN]["gw_id/cid1"] = {"device": child}
+
+    msg_child = mocker.MagicMock()
+    msg_child.payload = b"child_data"
+    msg_gw = mocker.MagicMock()
+    msg_gw.payload = b"gw_data"
+
+    mock_api()._get_socket.return_value = True
+    mock_api()._receive.side_effect = [msg_child, msg_gw]
+    mock_api()._process_message.side_effect = [
+        {"cid": "cid1", "dps": {"1": True}},
+        {"dps": {"2": "gw_val"}},
+    ]
+
+    gateway._running = True
+    child._running = True
+    gw_loop = gateway.async_receive()
+    child_loop = child.async_receive()
+
+    gw_result = await gw_loop.__anext__()
+    assert gw_result == {"2": "gw_val"}
+
+    child_result = await child_loop.__anext__()
+    assert child_result == {"1": True}
+
+
+@pytest.mark.asyncio
+async def test_async_receive_subdevice_polls_on_timeout(patched_hass, mock_api, mocker):
+    child = TuyaLocalDevice(
+        "Child",
+        "gw_id",
+        "some.ip.address",
+        "some_local_key",
+        "3.3",
+        "cid1",
+        patched_hass,
+    )
+    child._poll_queue.get = mocker.AsyncMock(
+        side_effect=[asyncio.TimeoutError, {"1": False}]
+    )
+
+    child._running = True
+    child_loop = child.async_receive()
+    result = await child_loop.__anext__()
+
+    mock_api().status.assert_called_once_with(nowait=True)
+    assert result == {"1": False}
 
 
 def test_should_poll(subject):
