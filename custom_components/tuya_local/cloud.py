@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
@@ -34,7 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 
 AUTH_CACHE_STORE_VERSION = 1
 AUTH_CACHE_STORE_KEY = f"{DOMAIN}.auth_cache"
-CLOUD_SYNC_INTERVAL = timedelta(minutes=5)
+CLOUD_SYNC_INTERVAL = timedelta(seconds=30)
 
 HUB_CATEGORIES = [
     "wgsxj",  # Gateway camera
@@ -104,6 +105,7 @@ async def _async_poll_restored_subdevice(hass: HomeAssistant, local_dev) -> None
     """Trigger a local status query after a subdevice comes back online."""
     async with local_dev._api_lock:
         await hass.async_add_executor_job(lambda: local_dev._api.status(nowait=True))
+        await asyncio.sleep(0.05)
 
 
 @callback
@@ -352,6 +354,8 @@ class DeviceListener(SharingDeviceListener):
         dp_timestamps: dict | None = None,
     ) -> None:
         """Device status has updated."""
+        if updated_status_properties is not None:
+            device.online = True
         _LOGGER.debug(
             "Received update for device %s: %s (properties %s)",
             device.id,
@@ -447,9 +451,9 @@ class TuyaCloudMonitor:
             listener = DeviceListener(self._hass, manager)
             manager.add_device_listener(listener)
 
-            await self._hass.async_add_executor_job(manager.update_device_cache)
-            for dev in manager.device_map.values():
-                dev.set_up = True
+            await self._hass.async_add_executor_job(
+                self._refresh_cloud_devices, manager
+            )
             await self._hass.async_add_executor_job(manager.refresh_mq)
 
             self._manager = manager
@@ -468,6 +472,47 @@ class TuyaCloudMonitor:
         finally:
             self._starting = False
 
+    @staticmethod
+    def _refresh_cloud_devices(manager: Manager) -> None:
+        """Refresh device online states without clearing device_map or per-device RPCs."""
+        if not getattr(manager, "user_homes", None) and hasattr(
+            manager, "home_repository"
+        ):
+            manager.user_homes = manager.home_repository.query_homes()
+        homes = getattr(manager, "user_homes", None)
+        fetched = False
+        if isinstance(homes, list) and homes and hasattr(manager, "customer_api"):
+            for home in homes:
+                response = manager.customer_api.get(
+                    "/v1.0/m/life/ha/home/devices", {"homeId": home.id}
+                )
+                if not isinstance(response, dict) or not response.get("success"):
+                    continue
+                fetched = True
+                for item in response.get("result", []):
+                    dev_id = item.get("id")
+                    if not dev_id:
+                        continue
+                    existing = manager.device_map.get(dev_id)
+                    if existing is not None:
+                        existing.online = item.get("online", existing.online)
+                    else:
+                        raw = dict(item)
+                        raw["status"] = {
+                            s["code"]: s["value"]
+                            for s in raw.get("status", [])
+                            if isinstance(s, dict) and "code" in s and "value" in s
+                        }
+                        dev = CustomerDevice(**raw)
+                        dev.set_up = True
+                        dev.support_local = True
+                        dev.local_strategy = {}
+                        manager.device_map[dev_id] = dev
+        if not fetched:
+            manager.update_device_cache()
+            for dev in manager.device_map.values():
+                dev.set_up = True
+
     @callback
     def sync_devices(self) -> None:
         """Apply known cloud online states to all registered local subdevices."""
@@ -481,7 +526,9 @@ class TuyaCloudMonitor:
         if self._manager is None:
             return
         try:
-            await self._hass.async_add_executor_job(self._manager.update_device_cache)
+            await self._hass.async_add_executor_job(
+                self._refresh_cloud_devices, self._manager
+            )
             self.sync_devices()
         except Exception as err:
             _LOGGER.debug("Periodic Tuya cloud status sync failed: %s", err)

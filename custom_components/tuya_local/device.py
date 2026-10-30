@@ -402,6 +402,10 @@ class TuyaLocalDevice(object):
                     if (
                         self.has_returned_state
                         and time() - last_cache > self._POLLING_INTERVAL
+                        and (
+                            not self._api.parent
+                            or self._supports_subdev_query(self._api.parent)
+                        )
                     ):
                         self.set_online(False)
                     self._api.set_socketPersistent(True)
@@ -476,7 +480,7 @@ class TuyaLocalDevice(object):
                     if not child:
                         _LOGGER.warning("Receive unknown cid: %s, %s", cid, self.dev_id)
                         continue
-                    if not child._online:
+                    if not child._online and getattr(msg, "cmd", None) != 8:
                         continue
                     if "dps" in poll:
                         poll = poll["dps"]
@@ -622,7 +626,7 @@ class TuyaLocalDevice(object):
         return new_state
 
     async def async_set_properties(self, properties):
-        if len(properties) == 0:
+        if len(properties) == 0 or not self._online:
             return
 
         self._add_properties_to_pending_updates(properties)
