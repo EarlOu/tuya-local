@@ -9,11 +9,16 @@ from custom_components.tuya_local.cloud import (
     Cloud,
     DeviceListener,
     TokenListener,
+    TuyaCloudMonitor,
+    _apply_cloud_subdevice_online,
+    async_start_cloud_monitor,
+    async_stop_cloud_monitor,
 )
 from custom_components.tuya_local.const import (
     CONF_ENDPOINT,
     CONF_LOCAL_KEY,
     CONF_TERMINAL_ID,
+    DATA_CLOUD,
     DOMAIN,
     TUYA_RESPONSE_CODE,
     TUYA_RESPONSE_MSG,
@@ -363,3 +368,73 @@ class TestHubCategories:
     def test_non_hub_category(self):
         assert "dj" not in HUB_CATEGORIES
         assert "wnykq" not in HUB_CATEGORIES
+
+
+class TestCloudSubdeviceMonitor:
+    def test_apply_cloud_subdevice_online_marks_subdevice_offline_and_online(
+        self, mock_hass
+    ):
+        local_subdev = MagicMock()
+        local_subdev.dev_cid = "0172e811f2"
+        local_subdev._online = True
+        mock_hass.data[DOMAIN]["gw_0172e811f2"] = {"device": local_subdev}
+
+        cloud_dev = MagicMock()
+        cloud_dev.node_id = "0172e811f2"
+        cloud_dev.online = False
+
+        _apply_cloud_subdevice_online(mock_hass, cloud_dev)
+        local_subdev.set_online.assert_called_once_with(False)
+
+        local_subdev.set_online.reset_mock()
+        local_subdev._online = False
+        cloud_dev.online = True
+        _apply_cloud_subdevice_online(mock_hass, cloud_dev)
+        local_subdev.set_online.assert_called_once_with(True)
+        mock_hass.async_create_task.assert_called_once()
+        mock_hass.async_create_task.call_args[0][0].close()
+
+    @pytest.mark.asyncio
+    async def test_cloud_monitor_start_sync_and_stop(self, mock_hass):
+        mock_hass.data[DOMAIN]["auth_cache"] = {
+            "user_code": "uc",
+            "terminal_id": "tid",
+            "endpoint": "ep",
+            "token_info": {"access_token": "at"},
+        }
+        local_subdev = MagicMock()
+        local_subdev.dev_cid = "0172e811f2"
+        local_subdev._online = True
+        mock_hass.data[DOMAIN]["gw_0172e811f2"] = {"device": local_subdev}
+
+        cloud_dev = MagicMock()
+        cloud_dev.id = "cdev1"
+        cloud_dev.node_id = "0172e811f2"
+        cloud_dev.online = False
+
+        with (
+            patch("custom_components.tuya_local.cloud.Manager") as MockManager,
+            patch(
+                "custom_components.tuya_local.cloud.async_track_time_interval"
+            ) as mock_interval,
+        ):
+            mock_manager = MockManager.return_value
+            mock_manager.device_map = {"cdev1": cloud_dev}
+            mock_manager.update_device_cache = MagicMock()
+            mock_manager.refresh_mq = MagicMock()
+            mock_mq = MagicMock()
+            mock_manager.mq = mock_mq
+
+            await async_start_cloud_monitor(mock_hass)
+
+            assert DATA_CLOUD in mock_hass.data[DOMAIN]
+            assert isinstance(mock_hass.data[DOMAIN][DATA_CLOUD], TuyaCloudMonitor)
+            mock_manager.update_device_cache.assert_called_once()
+            mock_manager.refresh_mq.assert_called_once()
+            assert cloud_dev.set_up is True
+            local_subdev.set_online.assert_called_once_with(False)
+            mock_interval.assert_called_once()
+
+            async_stop_cloud_monitor(mock_hass)
+            assert DATA_CLOUD not in mock_hass.data[DOMAIN]
+            mock_mq.stop.assert_called_once()

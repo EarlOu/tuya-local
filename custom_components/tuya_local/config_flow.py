@@ -25,7 +25,7 @@ from homeassistant.helpers.selector import (
 )
 
 from . import DOMAIN
-from .cloud import Cloud
+from .cloud import Cloud, async_load_auth_cache, async_start_cloud_monitor
 from .const import (
     API_PROTOCOL_VERSIONS,
     CONF_DEVICE_CID,
@@ -105,6 +105,8 @@ class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             mode = user_input.get("setup_mode")
             if mode == "cloud" or mode == "cloud_fresh_login":
+                if mode != "cloud_fresh_login":
+                    await async_load_auth_cache(self.hass)
                 self.init_cloud()
                 try:
                     if mode == "cloud_fresh_login":
@@ -113,6 +115,7 @@ class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
 
                     if self.cloud.is_authenticated:
                         self.__cloud_devices = await self.cloud.async_get_devices()
+                        await async_start_cloud_monitor(self.hass)
                         return await self.async_step_choose_device()
                 except Exception as e:
                     # Re-authentication is needed.
@@ -218,6 +221,7 @@ class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
             )
 
         self.__cloud_devices = await self.cloud.async_get_devices()
+        await async_start_cloud_monitor(self.hass)
         if self.__discovered_device:
             # If local discovery already found a device, we can skip the choose device step
             # after updating discovery_info.

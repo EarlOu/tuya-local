@@ -18,6 +18,7 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 from homeassistant.helpers.entity_registry import async_migrate_entries
 from homeassistant.util import slugify
 
+from .cloud import async_start_cloud_monitor, async_stop_cloud_monitor
 from .const import (
     CONF_DEVICE_CID,
     CONF_DEVICE_ID,
@@ -1152,6 +1153,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(entry, entities)
     await async_setup_services(hass, entities)
+    await async_start_cloud_monitor(hass)
 
     entry.add_update_listener(async_update_entry)
 
@@ -1195,6 +1197,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     ]
     if not remaining:
         async_stop_discovery(hass)
+        async_stop_cloud_monitor(hass)
 
     return True
 

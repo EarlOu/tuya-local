@@ -203,6 +203,11 @@ class TuyaLocalDevice(object):
         if not online:
             _LOGGER.debug("%s reported offline, marking unavailable", self.name)
             self._reset_cached_state()
+            while not self._poll_queue.empty():
+                try:
+                    self._poll_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
         for entity in self._children:
             entity.schedule_update_ha_state()
 
@@ -377,6 +382,11 @@ class TuyaLocalDevice(object):
                         lambda c=child: c._api.status(nowait=True)
                     )
 
+    @staticmethod
+    def _supports_subdev_query(api) -> bool:
+        version = getattr(api, "version", None)
+        return not isinstance(version, (int, float)) or version >= 3.4
+
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
         if self.dev_cid:
@@ -400,7 +410,9 @@ class TuyaLocalDevice(object):
                             await self._hass.async_add_executor_job(
                                 lambda: self._api.status(nowait=True)
                             )
-                        elif self._api.parent:
+                        elif self._api.parent and self._supports_subdev_query(
+                            self._api.parent
+                        ):
                             await self._hass.async_add_executor_job(
                                 lambda: self._api.parent.subdev_query(nowait=True)
                             )
@@ -423,7 +435,9 @@ class TuyaLocalDevice(object):
                             self._api.heartbeat,
                             True,
                         )
-                        if getattr(self._api, "children", None):
+                        if getattr(
+                            self._api, "children", None
+                        ) and self._supports_subdev_query(self._api):
                             await self._hass.async_add_executor_job(
                                 lambda: self._api.subdev_query(nowait=True)
                             )

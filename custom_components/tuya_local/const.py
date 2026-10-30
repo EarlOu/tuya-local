@@ -1,6 +1,7 @@
 DOMAIN = "tuya_local"
 DATA_STORE = "store"
 DATA_DISCOVERY = "discovery"
+DATA_CLOUD = "cloud_monitor"
 
 CONF_DEVICE_ID = "device_id"
 CONF_LOCAL_KEY = "local_key"
