@@ -110,7 +110,9 @@ async def _async_poll_restored_subdevice(hass: HomeAssistant, local_dev) -> None
 
 @callback
 def _apply_cloud_subdevice_online(
-    hass: HomeAssistant, cloud_device: CustomerDevice
+    hass: HomeAssistant,
+    cloud_device: CustomerDevice,
+    force_pulse: bool = False,
 ) -> None:
     """Apply cloud online/offline state to matching local gateway subdevices."""
     cid = getattr(cloud_device, "node_id", None) or getattr(cloud_device, "uuid", None)
@@ -129,6 +131,9 @@ def _apply_cloud_subdevice_online(
         if local_dev is None or getattr(local_dev, "dev_cid", None) != cid:
             continue
         was_online = getattr(local_dev, "_online", True)
+        if force_pulse and online and was_online:
+            local_dev.set_online(False)
+            was_online = False
         local_dev.set_online(online)
         if online and not was_online and hasattr(hass, "async_create_task"):
             hass.async_create_task(_async_poll_restored_subdevice(hass, local_dev))
@@ -354,8 +359,6 @@ class DeviceListener(SharingDeviceListener):
         dp_timestamps: dict | None = None,
     ) -> None:
         """Device status has updated."""
-        if updated_status_properties is not None:
-            device.online = True
         _LOGGER.debug(
             "Received update for device %s: %s (properties %s)",
             device.id,
@@ -364,13 +367,15 @@ class DeviceListener(SharingDeviceListener):
             else None,
             updated_status_properties,
         )
+        if updated_status_properties is not None:
+            return
         loop = getattr(self.__hass, "loop", None)
         if loop is not None and hasattr(loop, "call_soon_threadsafe"):
             loop.call_soon_threadsafe(
-                _apply_cloud_subdevice_online, self.__hass, device
+                _apply_cloud_subdevice_online, self.__hass, device, True
             )
         else:
-            _apply_cloud_subdevice_online(self.__hass, device)
+            _apply_cloud_subdevice_online(self.__hass, device, True)
 
     def add_device(self, device: CustomerDevice) -> None:
         """A new device has been added."""

@@ -394,6 +394,19 @@ class TestCloudSubdeviceMonitor:
         mock_hass.async_create_task.assert_called_once()
         mock_hass.async_create_task.call_args[0][0].close()
 
+        # When force_pulse=True and already online, pulses False -> True and polls
+        local_subdev.set_online.reset_mock()
+        mock_hass.async_create_task.reset_mock()
+        local_subdev._online = True
+        cloud_dev.online = True
+        _apply_cloud_subdevice_online(mock_hass, cloud_dev, force_pulse=True)
+        assert [c.args[0] for c in local_subdev.set_online.call_args_list] == [
+            False,
+            True,
+        ]
+        mock_hass.async_create_task.assert_called_once()
+        mock_hass.async_create_task.call_args[0][0].close()
+
     @pytest.mark.asyncio
     async def test_cloud_monitor_start_sync_and_stop(self, mock_hass):
         mock_hass.data[DOMAIN]["auth_cache"] = {

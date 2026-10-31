@@ -480,7 +480,7 @@ class TuyaLocalDevice(object):
                     if not child:
                         _LOGGER.warning("Receive unknown cid: %s, %s", cid, self.dev_id)
                         continue
-                    if not child._online and getattr(msg, "cmd", None) != 8:
+                    if not child._online:
                         continue
                     if "dps" in poll:
                         poll = poll["dps"]
